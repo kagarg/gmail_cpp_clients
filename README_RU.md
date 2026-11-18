@@ -113,3 +113,8 @@ cmake --build build -j
 - Тема письма кодируется как UTF-8 Base64, тело письма — как MIME `text/plain; charset=UTF-8` с Base64.
 - POP3 `RETR` показывает исходное MIME-содержимое письма. Для сложных писем с вложениями или HTML отдельный MIME-парсер не реализован.
 - Простая учебная реализация не поддерживает OAuth 2.0, IMAP, вложения и полноценное декодирование MIME.
+
+
+Сборка проекта:
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
