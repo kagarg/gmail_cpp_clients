@@ -45,7 +45,8 @@ void login(TlsConnection& connection,
 
 std::vector<std::string> readMultiline(TlsConnection& connection,
                                        const MailLogger& logger,
-                                       std::size_t maxBytes = 50 * 1024 * 1024)
+                                       std::size_t maxBytes = 50 * 1024 * 1024,
+                                       bool logLines = true)
 {
     std::vector<std::string> lines;
     std::size_t totalBytes = 0;
@@ -60,10 +61,10 @@ std::vector<std::string> readMultiline(TlsConnection& connection,
         if (totalBytes > maxBytes)
             throw std::runtime_error("Ответ POP3 превышает установленный предел 50 МиБ");
 
-        if (logger) logger("S: " + line);
+        if (logLines && logger) logger("S: " + line);
         lines.push_back(std::move(line));
     }
-    if (logger) logger("S: . [конец многострочного ответа]");
+    if (logLines && logger) logger("S: . [конец многострочного ответа]");
     return lines;
 }
 
@@ -113,7 +114,8 @@ std::vector<PopMessageInfo> Pop3Client::listMessages(const std::string& username
 
 std::string Pop3Client::retrieveMessage(const std::string& username,
                                         const std::string& appPassword,
-                                        int messageNumber)
+                                        int messageNumber,
+                                        bool logMessageContents)
 {
     if (username.empty() || appPassword.empty() || username.find_first_of("\r\n") != std::string::npos || messageNumber <= 0)
         throw std::invalid_argument("Неверные параметры получения письма");
@@ -125,7 +127,8 @@ std::string Pop3Client::retrieveMessage(const std::string& username,
                                               "RETR " + std::to_string(messageNumber),
                                               logger_);
     requireOk(response, "RETR");
-    const auto lines = readMultiline(connection, logger_);
+    const auto lines = readMultiline(connection, logger_, 50 * 1024 * 1024,
+                                     logMessageContents);
 
     std::string message;
     for (const std::string& line : lines) {

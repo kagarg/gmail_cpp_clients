@@ -13,7 +13,8 @@ public:
                                              const std::string& appPassword);
     std::string retrieveMessage(const std::string& username,
                                 const std::string& appPassword,
-                                int messageNumber);
+                                int messageNumber,
+                                bool logMessageContents = true);
     void deleteMessage(const std::string& username,
                        const std::string& appPassword,
                        int messageNumber);

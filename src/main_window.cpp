@@ -13,12 +13,17 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTextEdit>
+#include <QTextDocument>
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <algorithm>
+#include <cctype>
+#include <map>
 #include <exception>
 #include <string>
 
@@ -33,6 +38,165 @@ std::string toUtf8(const QString& value)
 {
     const QByteArray bytes = value.toUtf8();
     return std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()));
+}
+
+std::string lowerAscii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+QByteArray decodeQuotedPrintable(const QByteArray& input)
+{
+    QByteArray output;
+    output.reserve(input.size());
+    for (qsizetype i = 0; i < input.size(); ++i) {
+        if (input[i] == '=' && i + 1 < input.size()) {
+            if (input[i + 1] == '\r' && i + 2 < input.size() && input[i + 2] == '\n') {
+                i += 2;
+                continue;
+            }
+            if (input[i + 1] == '\n') {
+                ++i;
+                continue;
+            }
+            if (i + 2 < input.size()) {
+                bool ok = false;
+                const int byte = input.mid(i + 1, 2).toInt(&ok, 16);
+                if (ok) {
+                    output.append(static_cast<char>(byte));
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        output.append(input[i]);
+    }
+    return output;
+}
+
+QString decodeEncodedWords(const std::string& value)
+{
+    const QString input = fromUtf8(value);
+    const QRegularExpression expression(QStringLiteral("=\\?([^?]+)\\?([bBqQ])\\?([^?]*)\\?="));
+    QString output;
+    qsizetype offset = 0;
+    auto matches = expression.globalMatch(input);
+    while (matches.hasNext()) {
+        const auto match = matches.next();
+        output += input.mid(offset, match.capturedStart() - offset);
+        QByteArray bytes = match.captured(3).toLatin1();
+        if (match.captured(2).compare(QStringLiteral("B"), Qt::CaseInsensitive) == 0) {
+            bytes = QByteArray::fromBase64(bytes);
+        } else {
+            bytes.replace('_', ' ');
+            bytes = decodeQuotedPrintable(bytes);
+        }
+        output += QString::fromUtf8(bytes);
+        offset = match.capturedEnd();
+    }
+    output += input.mid(offset);
+    return output;
+}
+
+std::pair<std::map<std::string, std::string>, QByteArray> splitMimeEntity(QByteArray entity)
+{
+    entity.replace("\r\n", "\n");
+    const qsizetype separator = entity.indexOf("\n\n");
+    const QByteArray headerBlock = separator < 0 ? QByteArray{} : entity.left(separator);
+    const QByteArray body = separator < 0 ? entity : entity.mid(separator + 2);
+
+    std::map<std::string, std::string> headers;
+    const QList<QByteArray> lines = headerBlock.split('\n');
+    std::string lastHeader;
+    for (const QByteArray& line : lines) {
+        if (!line.isEmpty() && (line[0] == ' ' || line[0] == '\t') && !lastHeader.empty()) {
+            headers[lastHeader] += " " + line.trimmed().toStdString();
+            continue;
+        }
+        const qsizetype colon = line.indexOf(':');
+        if (colon <= 0) continue;
+        lastHeader = lowerAscii(line.left(colon).trimmed().toStdString());
+        headers[lastHeader] = line.mid(colon + 1).trimmed().toStdString();
+    }
+    return {std::move(headers), body};
+}
+
+std::string mimeParameter(const std::string& header, const std::string& name)
+{
+    const QRegularExpression expression(QStringLiteral("(?:^|;)\\s*") +
+        QString::fromStdString(name) + QStringLiteral("\\s*=\\s*(?:\"([^\"]*)\"|([^;\\s]*))"),
+        QRegularExpression::CaseInsensitiveOption);
+    const auto match = expression.match(QString::fromStdString(header));
+    if (!match.hasMatch()) return {};
+    return (match.captured(1).isEmpty() ? match.captured(2) : match.captured(1)).toStdString();
+}
+
+QString extractTextPart(const QByteArray& entity, bool allowHtml = true)
+{
+    auto [headers, body] = splitMimeEntity(entity);
+    const auto getHeader = [&headers](const std::string& name) {
+        const auto it = headers.find(name);
+        return it == headers.end() ? std::string{} : it->second;
+    };
+    const std::string contentType = lowerAscii(getHeader("content-type"));
+    if (contentType.rfind("multipart/", 0) == 0) {
+        const std::string boundary = mimeParameter(getHeader("content-type"), "boundary");
+        if (boundary.empty()) return {};
+        const QByteArray marker = "--" + QByteArray::fromStdString(boundary);
+        QString htmlFallback;
+        qsizetype start = 0;
+        while ((start = body.indexOf(marker, start)) >= 0) {
+            start += marker.size();
+            if (body.mid(start, 2) == "--") break;
+            if (body.mid(start, 2) == "\r\n") start += 2;
+            else if (body.mid(start, 1) == "\n") ++start;
+            qsizetype end = body.indexOf(marker, start);
+            if (end < 0) end = body.size();
+            QByteArray part = body.mid(start, end - start).trimmed();
+            const QString text = extractTextPart(part, allowHtml);
+            if (!text.isEmpty()) {
+                const auto [partHeaders, ignoredBody] = splitMimeEntity(part);
+                const auto typeIt = partHeaders.find("content-type");
+                const std::string partType = typeIt == partHeaders.end() ? "text/plain" : lowerAscii(typeIt->second);
+                if (partType.find("text/plain") != std::string::npos) return text;
+                if (htmlFallback.isEmpty()) htmlFallback = text;
+            }
+            start = end;
+        }
+        return htmlFallback;
+    }
+
+    const bool isHtml = contentType.find("text/html") != std::string::npos;
+    if (!contentType.empty() && contentType.find("text/") != 0) return {};
+    if (isHtml && !allowHtml) return {};
+
+    QByteArray decoded = body;
+    const std::string encoding = lowerAscii(getHeader("content-transfer-encoding"));
+    if (encoding.find("base64") != std::string::npos)
+        decoded = QByteArray::fromBase64(decoded);
+    else if (encoding.find("quoted-printable") != std::string::npos)
+        decoded = decodeQuotedPrintable(decoded);
+    QString text = QString::fromUtf8(decoded);
+    if (isHtml) {
+        QTextDocument document;
+        document.setHtml(text);
+        text = document.toPlainText();
+    }
+    return text.trimmed();
+}
+
+QString formatMessage(const std::string& rawMessage)
+{
+    const auto [headers, body] = splitMimeEntity(QByteArray::fromStdString(rawMessage));
+    const auto subject = headers.find("subject");
+    const QString decodedSubject = subject == headers.end()
+        ? QStringLiteral("(без темы)") : decodeEncodedWords(subject->second).trimmed();
+    QString text = extractTextPart(QByteArray::fromStdString(rawMessage));
+    if (text.isEmpty()) text = QStringLiteral("(текстовая часть письма не найдена)");
+    return QStringLiteral("Тема: %1\n\n%2").arg(decodedSubject, text);
 }
 
 } // namespace
@@ -222,8 +386,8 @@ void MainWindow::retrieveSelectedMessage()
         Pop3Client client(logger);
         const std::string message = client.retrieveMessage(
             toUtf8(accountEdit_->text().trimmed()),
-            removeSpaces(toUtf8(passwordEdit_->text())), number);
-        messageView_->setPlainText(fromUtf8(message));
+            removeSpaces(toUtf8(passwordEdit_->text())), number, false);
+        messageView_->setPlainText(formatMessage(message));
     }
     catch (const std::exception& error) {
         const QString message = QString::fromUtf8(error.what());
